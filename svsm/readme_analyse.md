@@ -9,6 +9,7 @@ Linux SVSM基于SNP和SEV技术：这边在之后建议查阅相关的文档。
 SEV-SNP, Qemu, OVMF BIOS, Compatible guest.
 
 ## 启动：
+一些细节在本人提供的文件
 尝试解读start.S文件：
 
 在这个文件中我们首先看到了下面的几个定义：
@@ -35,3 +36,6 @@ Systems running with five-level paging will support 52-bit physical addresses an
 ```
 在这篇post发出时，到现在其实也就五年多，可以得知这确实是一个新的技术。
 
+在SVSM启动时，首先运行脚本start.S中的相关内容，完成最开始的GHCB shared过程。在完成了一些零碎的初始化过程之后，我们的程序会进入svsm_main函数之中。
+
+## 
