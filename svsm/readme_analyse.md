@@ -197,3 +197,111 @@ lazy_static! {
 可以查看`AMD-ES`和`AMD SEV-SNP`中的一部分流程图，从而得到一个基本的认识。
 
 至于`vc`的初始化，我们可以看到其基本框架如下：
+```rust
+pub fn vc_init() {
+    let ghcb_pa: PhysAddr = pgtable_va_to_pa(get_early_ghcb());
+
+    vc_establish_protocol();
+    vc_register_ghcb(ghcb_pa);
+}
+```
+函数`pgtable_va_to_pa`示意图如下所示：
+```rust
+/// Obtain physical address (PA) of a page given its VA
+pub fn pgtable_va_to_pa(va: VirtAddr) -> PhysAddr {
+    PhysAddr::new_truncate(va.as_u64() - SVSM_GVA_OFFSET.as_u64())
+}
+```
+似乎在`SVSM`中一开始的地址转换较为轻松，只需要把虚拟地址的高`12`位全部清除掉就好了。当然这是页表等东东尚未启动的时候的情况。
+
+首先我们得到`ghcb_pa`的物理地址。接下来利用函数`vc_establish_protocol`来对`GHCB`模块按照协议进行处理。
+```rust
+fn vc_establish_protocol() {
+    let mut response: u64;
+
+    // Request SEV information
+    // GHCB_MSR_SEV_INFO_REQ是GHCB协议中专门用于REQ的位
+    // 如果其值为2，则说明是这个功能，具体可以查看GHCB的参数表格。
+    // 见2.3.1中的协议表格
+    response = vc_msr_protocol(GHCB_MSR_SEV_INFO_REQ);
+
+    // Validate the GHCB protocol version
+    // 返回值须得是0x001，低十二位，检查合法与否。
+    if GHCB_MSR_INFO!(response) != GHCB_MSR_SEV_INFO_RES {
+        vc_terminate_ghcb_general();
+    }
+
+    // 检查response之中是否超出了大值和小值，支持的版本号是一串
+    // 看样子是一串连续的数字，因此可以做这样的比较。
+    if GHCB_MSR_PROTOCOL_MIN!(response) > GHCB_PROTOCOL_MAX
+        || GHCB_MSR_PROTOCOL_MAX!(response) < GHCB_PROTOCOL_MIN
+    {
+        vc_terminate_ghcb_unsupported_protocol();
+    }
+
+    // Request hypervisor feature support
+    // 0x80对应的功能，得到hypervisor feature support bitmap
+    // 存放在GHCB INFO低十二位部分。
+    // 高位被设置为0。
+    response = vc_msr_protocol(GHCB_MSR_HV_FEATURE_REQ);
+
+    // Validate required SVSM feature(s)
+    // 理应得到的低12位返回值是0x81号数据，与上面相应成趣。作为返回值。
+    if GHCB_MSR_INFO!(response) != GHCB_MSR_HV_FEATURE_RES {
+        vc_terminate_ghcb_general();
+    }
+
+    // 
+    if (GHCB_MSR_HV_FEATURES!(response) & GHCB_SVSM_FEATURES) != GHCB_SVSM_FEATURES {
+        vc_terminate_ghcb_feature();
+    }
+
+    unsafe {
+        HV_FEATURES = GHCB_MSR_HV_FEATURES!(response);
+    }
+}
+```
+函数`vc_msr_protocol`如下所示：
+```rust
+fn vc_msr_protocol(request: u64) -> u64 {
+    let response: u64;
+
+    // Save the current GHCB MSR value
+    let value: u64 = rdmsr(MSR_GHCB);
+
+    // Perform the MSR protocol
+    wrmsr(MSR_GHCB, request);
+    vc_vmgexit();
+    response = rdmsr(MSR_GHCB);
+
+    // Restore the GHCB MSR value
+    wrmsr(MSR_GHCB, value);
+
+    response
+}
+```
+其中参数`request`的上文被设置为了`2`，恰好表示的意思是`REQUEST`相关。在这边利用指令rdmsr来讲`MSR_GHCB`固定需要投入的参数写入`rcx`寄存器，再把返回的结果写回到`value`之中，其中高位是`rdx`信息，低位是`rax`信息。
+
+这一步的目的是把我们原本的值存放在`value`之中，然后我们就能把`request`信息写入到对应的寄存器中，以执行我们后续的一些操作。
+
+但函数`vc_vmgexit`相对来说比较简单，其中似乎主要就是`rep vmmcall`一下就好了。
+```rust
+fn vc_vmgexit() {
+    unsafe {
+        asm!("rep vmmcall");
+    }
+}
+```
+最终返回`response`作为结果。我们利用得到该信息后，需要检查这个`GHCB protocol`返回的信息是否是合法的。由于整个`flag`的大小是`12`位，需要与`0xfff`进行`&`操作。
+
+根据手册上的指示，返回值一定是`0x001`才能说明奏效了。这便是第一步的检验。之后，针对第一步检验后得到的返回值`GHCBData`信息需要进行第二部检验。
+
+根据手册上的信息，我们可以得知：
+```
+0x001 – SEV Information
+▪ GHCBData[63:48] specifies the maximum GHCB protocol version supported.
+▪ GHCBData[47:32] specifies the minimum GHCB protocol version supported.
+▪ GHCBData[31:24] specifies the SEV page table encryption bit number.
+```
+用户需要通过`GHCBData`中提供的版本号来确定`hypervisor`到底支持哪些版本，从而选择合适版本并对`GHCB Protocol`协议的版本做一些限定。如果`guest`没法支持`hypervisor`提供的协议范围，那就寄了，需要发送`0x100`表示终结我们的任务。
+
