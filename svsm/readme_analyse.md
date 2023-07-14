@@ -191,7 +191,7 @@ lazy_static! {
 我们可以看到这里用了很经典的`lazy_static`方法，并利用`x86-64`模块中的部分组件来实现，当然，他们使用的模块是经过自己修改后的版本，内部嵌入了关于`#VC`、`#GP`等错误处理器放置的地方。在`unsafe`模块中设置了`df_handler`作为`double_fault`的处理者。
 
 其他异常处理采用的初始化方式类似。最后利用`lidt`指令装载进去。
-### vc_init: VC 中断处理
+### vc_init: VC 中断处理初始化
 `VC`问题本质上是`VMM communication exception`问题。这是由`CPU`触发的中断，一般是在需要`hypervisor emulation`环节时才会触发的中断。
 
 可以查看`AMD-ES`和`AMD SEV-SNP`中的一部分流程图，从而得到一个基本的认识。
@@ -251,11 +251,14 @@ fn vc_establish_protocol() {
         vc_terminate_ghcb_general();
     }
 
-    // 
+    // 对于返回的data值，检查其中的flag，必须要求其中的某一部分存在：
+    // bit 0，bit 1两个部分是一定要存在的，其他无所谓
+    // 不太清楚bit 4为什么也算在flag之中，我在GHCB中没有看到这个指示
     if (GHCB_MSR_HV_FEATURES!(response) & GHCB_SVSM_FEATURES) != GHCB_SVSM_FEATURES {
         vc_terminate_ghcb_feature();
     }
 
+    // 将所支持的HV_FEATURES特性存储在这个名为HV的变量之中
     unsafe {
         HV_FEATURES = GHCB_MSR_HV_FEATURES!(response);
     }
@@ -305,3 +308,81 @@ fn vc_vmgexit() {
 ```
 用户需要通过`GHCBData`中提供的版本号来确定`hypervisor`到底支持哪些版本，从而选择合适版本并对`GHCB Protocol`协议的版本做一些限定。如果`guest`没法支持`hypervisor`提供的协议范围，那就寄了，需要发送`0x100`表示终结我们的任务。
 
+在完成了`vc_establish_protocol`函数之后，我们进入函数`vc_register_ghcb`之中。该函数的大体情况如下所示：
+```rust
+pub fn vc_register_ghcb(pa: PhysAddr) {
+    // Perform GHCB registration
+    let response: u64 = vc_msr_protocol(GHCB_MSR_REGISTER_GHCB!(pa.as_u64()));
+
+    // Validate the response
+    // 按照手册，这一步很自然。
+    if GHCB_MSR_INFO!(response) != GHCB_MSR_REGISTER_GHCB_RES {
+        vc_terminate_svsm_general();
+    }
+
+    // 这一步也相当自然。
+    if GHCB_MSR_DATA!(response) != pa.as_u64() {
+        vc_terminate_svsm_general();
+    }
+
+    // 不知道为什么，反正先把pa写到了rax和rcx之中。
+    // 可能之后有用到。
+    wrmsr(MSR_GHCB, pa.as_u64());
+}
+```
+我们一点点来看，先分析`vc_msr_protocol`的参数，其根据`ghcb_pa`，即`early_ghcb`的物理地址来确定它的`request`，其中`GHCB_MSR_REGISTER_GHCB`宏的信息如下所示：
+```rust
+// MSR protocol: GHCB registration
+/// 0x12
+const GHCB_MSR_REGISTER_GHCB_REQ: u64 = 0x12;
+macro_rules! GHCB_MSR_REGISTER_GHCB {
+    ($x: expr) => {
+        (($x) | GHCB_MSR_REGISTER_GHCB_REQ)
+    };
+}
+```
+在这边本质上是把`Request`与`pa`一起封装成`64`位的协议数据包，可以参考手册，其上恰是这么要求的。
+```
+ 0x012 – Register GHCB GPA Request
+▪ GHCBData[63:12] – GHCB GFN to register
+Written by the guest to request the GHCB guest physical address (GHCB GPA 
+= GHCB GFN << 12) be registered for the vCPU invoking the VMGEXIT. See
+section 2.3.2 for further details and restrictions.
+```
+在2.3.2环节中，这一段代码对应的是后面的`Register`环节。把这个信息写入到`request`变量中后，根据手册，我们需要看到`0x13`作为`GHCBInfo`返回值。而`data`段`hypervisor`则需要用`GHCB GPA`来进行响应。
+
+到这里，这个函数也分析完了。
+
+### mem_init: 内存初始化
+这个函数大体上如下所示：
+```rust
+/// Initialized the runtime memory allocator
+///
+/// The mem_init() function sets up the root memory region data structures so
+/// that memory can be allocated and released. It will set up the page
+/// meta-data information and the free-lists for every supported allocation order
+/// of the buddy allocator.
+/// It will also setup the SLAB allocator for allocations up to 2 KiB.
+pub fn mem_init() {
+    STATIC_ASSERT!(MAX_ORDER < REAL_MAX_ORDER);
+
+    unsafe {
+        __mem_init();
+    }
+}
+
+unsafe fn __mem_init() {
+    let pstart: PhysAddr = pgtable_va_to_pa(get_dyn_mem_begin());
+    let pend: PhysAddr = pgtable_va_to_pa(get_dyn_mem_end());
+
+    let mem_begin: PhysFrame = PhysFrame::containing_address(pstart);
+    let mem_end: PhysFrame = PhysFrame::containing_address(pend);
+
+    vc_early_make_pages_private(mem_begin, mem_end);
+
+    let vstart: VirtAddr = get_dyn_mem_begin();
+    let page_count: usize = ((pend.as_u64() - pstart.as_u64()) / PAGE_SIZE) as usize;
+
+    root_mem_init(pstart, vstart, page_count);
+}
+```
