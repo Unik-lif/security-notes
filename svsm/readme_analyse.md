@@ -372,17 +372,113 @@ pub fn mem_init() {
 }
 
 unsafe fn __mem_init() {
+    // 这边我们暂且不管这个动态地址是怎么做的，就把它当做实际上跑的时候的动态地址吧
     let pstart: PhysAddr = pgtable_va_to_pa(get_dyn_mem_begin());
     let pend: PhysAddr = pgtable_va_to_pa(get_dyn_mem_end());
 
+    // 利用pstart和pend值来确定对应的PhysFrame物理页号
     let mem_begin: PhysFrame = PhysFrame::containing_address(pstart);
     let mem_end: PhysFrame = PhysFrame::containing_address(pend);
 
+    // 将从mem_begin开始到mem_end结束的物理页号对应的物理内存设置为private状态
     vc_early_make_pages_private(mem_begin, mem_end);
 
     let vstart: VirtAddr = get_dyn_mem_begin();
     let page_count: usize = ((pend.as_u64() - pstart.as_u64()) / PAGE_SIZE) as usize;
 
     root_mem_init(pstart, vstart, page_count);
+}
+```
+在这边我们需要研究一下函数`vc_early_make_pages_private`，如下所示：
+```rust
+// 该函数把Ghcb记作一个可变项
+pub fn vc_early_make_pages_private(begin: PhysFrame, end: PhysFrame) {
+    let ghcb: *mut Ghcb = get_early_ghcb().as_mut_ptr() as *mut Ghcb;
+
+    perform_page_state_change(ghcb, begin, end, PSC_PRIVATE);
+}
+
+fn perform_page_state_change(ghcb: *mut Ghcb, begin: PhysFrame, end: PhysFrame, page_op: u64) {
+    // 不太清楚这个数据结构具体做什么。
+    /*
+        #[repr(C, packed)]
+        struct PscOp {
+            pub header: PscOpHeader,
+            pub entries: [PscOpData; PSC_ENTRIES],
+        }
+    */
+    let mut op: PscOp = PscOp::new();
+
+    // 利用begin和end来确定物理页的起始地址
+    let mut pa: PhysAddr = begin.start_address();
+    let pa_end: PhysAddr = end.start_address();
+
+    // 逐页遍历
+    // 其中的PsC数据结构大概是一个用于虚拟机页面状态更改的数据结构和操作类型。
+    while pa < pa_end {
+        op.header.cur_entry = 0;
+        // 可以把op当做一个管理者
+        // 在build_psc_entries内部实现了逐个页面遍历并且赋上page_op属性的操作
+        // 在这边建立了op，以方便管理，提前为页面分配了相应的空间，并且以op的形式进行存储
+        pa = build_psc_entries(&mut op, pa, pa_end, page_op);
+
+        let last_entry: u16 = op.header.end_entry;
+
+        // 如果传递的参数page_op是PSC_SHARED类型，则采用下面的方式继续拿给你pvalidate
+        // 创建的时候首先还是设置为不合法状态，所以记作RESCIND
+        if page_op == PSC_SHARED {
+            pvalidate_psc_entries(&mut op, RESCIND);
+        }
+
+        let size: usize =
+            size_of::<PscOpHeader>() + size_of::<PscOpData>() * (last_entry as usize + 1);
+        unsafe {
+            let set_bytes: *const u8 = &op as *const PscOp as *const u8;
+            let get_bytes: *mut u8 = &mut op as *mut PscOp as *mut u8;
+
+            (*ghcb).clear();
+
+            (*ghcb).set_shared_buffer(set_bytes, size);
+
+            while op.header.cur_entry <= last_entry {
+                vc_perform_vmgexit(ghcb, GHCB_NAE_PSC, 0, 0);
+                if !(*ghcb).is_sw_exit_info_2_valid() || (*ghcb).sw_exit_info_2() != 0 {
+                    vc_terminate_svsm_psc();
+                }
+
+                (*ghcb).shared_buffer(get_bytes, size);
+            }
+        }
+
+        if page_op == PSC_PRIVATE {
+            op.header.cur_entry = 0;
+            op.header.end_entry = last_entry;
+            pvalidate_psc_entries(&mut op, VALIDATE);
+        }
+    }
+}
+
+// 可以把op当做一个管理者
+// 在build_psc_entries内部实现了逐个页面遍历并且赋上page_op属性的操作
+// 直到遍历完成，此时在op.entries[i]内将会存放各个页对应的信息，2MB和4KB不同的页面将会以不同的方式来进行存储
+// 他们的区别可以通过GHCB_2MB等相关宏进行区分，这边做的方式很武断，直接 | 上一个2 ^ 56，从而彻底避开了干扰
+fn build_psc_entries(op: &mut PscOp, begin: PhysAddr, end: PhysAddr, page_op: u64) -> PhysAddr {
+    let mut pa: PhysAddr = begin;
+    let mut i: usize = 0;
+
+    while pa < end && i < PSC_ENTRIES {
+        if pa.is_aligned(PAGE_2MB_SIZE) && (end - pa) >= PAGE_2MB_SIZE {
+            op.entries[i].data = GHCB_2MB_PSC_ENTRY!(pa.as_u64(), page_op);
+            pa += PAGE_2MB_SIZE;
+        } else {
+            op.entries[i].data = GHCB_4KB_PSC_ENTRY!(pa.as_u64(), page_op);
+            pa += PAGE_SIZE;
+        }
+        op.header.end_entry = i as u16;
+
+        i += 1;
+    }
+
+    return pa;
 }
 ```
