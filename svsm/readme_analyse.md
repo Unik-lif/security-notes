@@ -436,20 +436,28 @@ fn perform_page_state_change(ghcb: *mut Ghcb, begin: PhysFrame, end: PhysFrame, 
             let set_bytes: *const u8 = &op as *const PscOp as *const u8;
             let get_bytes: *mut u8 = &mut op as *mut PscOp as *mut u8;
 
+            // 对ghcb页面做清空处理，清空exit code以及valid_bitmap之中的内容
             (*ghcb).clear();
 
+            // 对ghcb中的大小为size的空间设置为可以被共享的情况
+            // size对应的部分其实是管理者PscOp的全部信息内容，说白了就是一个像管理向量一样的东西，把它设置成shared状态
+            // 将op内用于管理的那些数据整体赋值到ghcb之中，数据长度为size，源数据为op，拷贝目标地址为ghcb
             (*ghcb).set_shared_buffer(set_bytes, size);
 
             while op.header.cur_entry <= last_entry {
+                // 设置GHCB_NAE_PSC并退出，调用vmmcall指令
+                // psc是svsm之上的组件
                 vc_perform_vmgexit(ghcb, GHCB_NAE_PSC, 0, 0);
                 if !(*ghcb).is_sw_exit_info_2_valid() || (*ghcb).sw_exit_info_2() != 0 {
                     vc_terminate_svsm_psc();
                 }
-
+                // 继续执行拷贝操作，东西记录在ghcb之中
                 (*ghcb).shared_buffer(get_bytes, size);
             }
         }
 
+        // 如一开始就打算作为私有，则很快就能把它设置为VALIDATE状态
+        // 记作shared的GHCB本身应该被设置为RESINE状态
         if page_op == PSC_PRIVATE {
             op.header.cur_entry = 0;
             op.header.end_entry = last_entry;
@@ -481,4 +489,120 @@ fn build_psc_entries(op: &mut PscOp, begin: PhysAddr, end: PhysAddr, page_op: u6
 
     return pa;
 }
+
+// pvalidate_psc_entries函数信息
+// 对于psc_entries，利用pvalidate_op，通过op，进行pvalidate状态调整操作
+fn pvalidate_psc_entries(op: &mut PscOp, pvalidate_op: u32) {
+    let first_entry: usize = op.header.cur_entry as usize;
+    let last_entry: usize = op.header.end_entry as usize + 1;
+
+    // 从op中的header入手，逐项进行解析
+    // 拆分掉header entry内我们先前内嵌的一些信息，从而精准获取gpa，size等信息
+    // 最终目的是对于VM entry进行pvalidate化，毕竟pvalidate的对象应该是虚拟内存页面
+    for i in first_entry..last_entry {
+        let gpa: u64 = GHCB_PSC_GPA!(op.entries[i].data);
+        let size: u32 = GHCB_PSC_SIZE!(op.entries[i].data);
+
+        let mut va: VirtAddr = pgtable_pa_to_va(PhysAddr::new(gpa));
+        // 对vm entry实现pvalidate操作，这是一串特殊的指令，采用.byte 0xf2, 0x0f, 0x01, 0xff的方式来进行表示
+        // 其中最后返回值可以对应的状态大体如下：
+        /*
+            /// 1
+            pub const PVALIDATE_FAIL_INPUT: u32 = 1;
+            /// 6
+            pub const PVALIDATE_FAIL_SIZE_MISMATCH: u32 = 6;
+
+            根据指令集手册，一般只有0,1,6三种类型的返回值，因此下面的三种类型可能是其他扩展功能
+            我们所能确定的一件事情倒是：最大提供的值似乎是0xf
+            /// 15
+            pub const PVALIDATE_RET_MAX: u32 = 15;
+            /// 16
+            pub const PVALIDATE_CF_SET: u32 = 16;
+            /// 17
+            pub const PVALIDATE_RET_ERR: u32 = 17;
+        */
+        let mut ret: u32 = pvalidate(va.as_u64(), size, pvalidate_op);
+        if ret == PVALIDATE_FAIL_SIZE_MISMATCH && size > 0 {
+            let va_end = va + PAGE_2MB_SIZE;
+
+            while va < va_end {
+                ret = pvalidate(va.as_u64(), 0, pvalidate_op);
+                if ret != 0 {
+                    break;
+                }
+
+                va += PAGE_SIZE;
+            }
+        }
+        // 正常完成的返回值是0，其他的都不被允许，会采用各种各样的方式将它处理掉。
+        if ret != 0 {
+            vc_terminate_svsm_psc();
+        }
+    }
+}
 ```
+将`early_ghcb`所对应的虚拟地址设置完备后，我们现在看一下函数`root_mem_init`：
+```rust
+fn root_mem_init(pstart: PhysAddr, vstart: VirtAddr, page_count: usize) {
+    {
+        let mut region = ROOT_MEM.lock();
+        region.start_phys = pstart;
+        region.start_virt = vstart;
+        region.page_count = page_count;
+        // init_memory函数开辟了大小为PageStorageType的meta_pages，以及其余选项
+        // 这里头的细节比较多，涉及SVSM页面设置上的一些细节，我们在分析mem_init函数时还是不要在这个地方做过多停留了。
+        region.init_memory();
+        // drop lock here so SLAB initialization does not deadlock
+    }
+
+    // 启用SLAB内存分配器
+    if let Err(_e) = SLAB_PAGE_SLAB.lock().init() {
+        panic!("Failed to initialize SLAB_PAGE_SLAB");
+    }
+}
+```
+`ROOT_MEM`是一块标准的地址区域，其包含信息如下：
+```rust
+/// Data structure representing a region of allocatable memory
+///
+/// The memory region must be physically and virtually contiguous and
+/// implements a buddy algorithm for page allocations.
+///
+/// All allocations have a power-of-two size and are naturally aligned
+/// (virtually). For allocations to be naturally aligned physically the virtual
+/// and physical start addresses must be aligned at MAX_ORDER allocation size.
+///
+/// The buddy allocator takes some memory for itself to store per-page page
+/// meta-data, which is currently 8 bytes per PAGE_SIZE page.
+struct MemoryRegion {
+    /// Physical start address
+    start_phys: PhysAddr,
+    /// Virtual start address
+    start_virt: VirtAddr,
+    /// Total number of PAGE_SIZE
+    page_count: usize,
+    /// Total number of pages in the region per ORDER
+    nr_pages: [usize; MAX_ORDER],
+    /// Next free page per ORDER
+    next_page: [usize; MAX_ORDER],
+    /// Number of free pages per ORDER
+    free_pages: [usize; MAX_ORDER],
+}
+
+// 初始化过程则如下所示：看得出来也确实比较好玩
+pub const fn new() -> Self {
+    MemoryRegion {
+        start_phys: PhysAddr::new(0),
+        start_virt: VirtAddr::new_truncate(0),
+        page_count: 0,
+        nr_pages: [0; MAX_ORDER],
+        next_page: [0; MAX_ORDER],
+        free_pages: [0; MAX_ORDER],
+    }
+}
+```
+总而言之，在`mem_init`函数中，我们通过读`ghcb`块，并利用`pvalidate`命令将其设置为用户所私有的块，并对`root_mem`做了一些初始化工作。
+
+这个代码分析流程似乎比我想象的漫长很多，我们还是悠着点吧。
+
+还是不以这种粘贴的形式进行代码解读了，直接在原来的工程代码中做注释比较好。
