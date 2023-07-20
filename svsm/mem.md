@@ -53,7 +53,6 @@ pub fn vc_early_make_pages_private(begin: PhysFrame, end: PhysFrame) {、
 函数`perform_page_state_change`用于将`begin`和`end`区域内的物理内存拷贝到`ghcb`之中。
 ```rust
 fn perform_page_state_change(ghcb: *mut Ghcb, begin: PhysFrame, end: PhysFrame, page_op: u64) {
-    // 不太清楚这个数据结构具体做什么。
     /*
         #[repr(C, packed)]
         struct PscOp {
@@ -68,8 +67,8 @@ fn perform_page_state_change(ghcb: *mut Ghcb, begin: PhysFrame, end: PhysFrame, 
     let pa_end: PhysAddr = end.start_address();
 
     // 逐页遍历
-    // 其中的PsC数据结构大概是一个用于虚拟机页面状态更改的数据结构和操作类型。
     while pa < pa_end {
+        // 设置op的头为cur_entry，表示从0开始向下遍历
         op.header.cur_entry = 0;
         // 可以把op当做一个管理者
         // 在build_psc_entries内部实现了逐个页面遍历并且赋上page_op属性的操作
@@ -119,7 +118,65 @@ fn perform_page_state_change(ghcb: *mut Ghcb, begin: PhysFrame, end: PhysFrame, 
         }
     }
 }
+```
+在这边函数中创造的`PscOp`值得我们研究，该数据结构如下所示：
+```rust
+#[allow(dead_code)]
+impl PscOp {
+    pub const fn new() -> Self {
+        let h: PscOpHeader = PscOpHeader::new();
+        let d: PscOpData = PscOpData::new();
 
+        PscOp {
+            header: h,
+            entries: [d; PSC_ENTRIES],
+        }
+    }
+    funcs!(header, PscOpHeader);
+    funcs!(entries, [PscOpData; PSC_ENTRIES]);
+}
+```
+`PscOp`由`header`和`entries`共同组成，对于`Header`和`Data`，其数据结构如下所示：
+```rust
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct PscOpHeader {
+    pub cur_entry: u16,
+    pub end_entry: u16,
+    pub reserved: u32,
+}
+
+#[allow(dead_code)]
+impl PscOpHeader {
+    pub const fn new() -> Self {
+        PscOpHeader {
+            cur_entry: 0,
+            end_entry: 0,
+            reserved: 0,
+        }
+    }
+    funcs!(cur_entry, u16);
+    funcs!(end_entry, u16);
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct PscOpData {
+    pub data: u64,
+}
+
+#[allow(dead_code)]
+impl PscOpData {
+    pub const fn new() -> Self {
+        PscOpData { data: 0 }
+    }
+    funcs!(data, u64);
+}
+```
+`PscOp`像是一个用于存放信息的数组，其中`header`中包含了`cur_entry`和`end_entry`等相关信息，以方便在`Data`的管理数组`Entries`之中进行访问与遍历。
+
+在有了这个存放信息用的结构体后，我们用`build_psc_entries`函数进行来对`svsm`动态内存的全部物理页进行检视。在`svsm`的建立过程中，优先采用`2MB`的大页形式
+```rust
 // 可以把op当做一个管理者
 // 在build_psc_entries内部实现了逐个页面遍历并且赋上page_op属性的操作
 // 直到遍历完成，此时在op.entries[i]内将会存放各个页对应的信息，2MB和4KB不同的页面将会以不同的方式来进行存储
