@@ -380,3 +380,5 @@ unsafe fn __pgtable_init(flags: PageTableFlags, allocator: &mut PageTableAllocat
 }
 ```
 到这里，我们对于页表的代码解读便结束了。
+
+在完成了`mem.md`部分的阅读之后，我们对PageTable的分配过程有了更加清楚的认知，我们或许需要在之后更进一步对这个东西展开解读。
