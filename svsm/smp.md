@@ -398,4 +398,4 @@ pub fn vc_ap_create(vmsa_va: VirtAddr, apic_id: u32) {
 ```
 在一切准备就绪的情况下，需要通过`Virtual Communication`来让`hypervisor`所知道需要处理这些要求。
 
-至此，该函数的解读任务便结束了。
+至此，该函数的解读任务便结束了。到这一步我们初始化了`AP`，并给它们在`VMPL0`级别的`VMSA`上写了一些杂七杂八的东西。
