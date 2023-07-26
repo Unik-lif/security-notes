@@ -291,23 +291,24 @@ pub fn vc_run_vmpl(vmpl: VMPL) {
 fn ap_start(cpu_id: usize) -> bool {
     // 以PERCPU作为基地址，找到apic_id的信息
     let apic_id: u32 = unsafe { PERCPU.apic_id_for(cpu_id) };
-
+    // 为cpu_id所对应的这个AP分配了一个svsm_vmsa，运行在VMPL0之上
     let vmsa: VirtAddr = create_svsm_vmsa(cpu_id);
-
+    // 用rmpadjust指令来处理vmsa对应的页，在attrs中写入对应的信息
     let ret: u32 = rmpadjust(vmsa.as_u64(), RMP_4K, VMSA_PAGE | VMPL::Vmpl1 as u64);
     if ret != 0 {
         vc_terminate_svsm_general();
     }
-
+    // 为APs建立栈空间
     let stack: VirtAddr = mem_create_stack(SVSM_STACK_PAGES, false);
     set_cpu_stack(stack.as_u64());
 
     unsafe {
+        // 为APs在VMPL0的情况下找到对应的vmsa
         PERCPU.set_vmsa_for(pgtable_va_to_pa(vmsa), VMPL::Vmpl0, cpu_id);
-
+        // 原神，启动！！
         AP_SYNC = AP_STARTING;
         BARRIER!();
-
+        // 通过virtual communication来真实创建ap
         vc_ap_create(vmsa, apic_id);
 
         while AP_SYNC != AP_STARTED {
@@ -319,3 +320,82 @@ fn ap_start(cpu_id: usize) -> bool {
 }
 ```
 从注释上来看它确实功能很简单，给定一个`AP`，让它跑起来，说白了就这么多。为了要跑起来应该怎么做？当然要去设置它的栈空间和`VMSA`相关的东西。
+
+对于函数`create_svsm_vmsa`，其整体结构如下所示：为`for_id`所对应的`AP`分配设置了一个运行在`VMPL0`之上的`VMSA`。
+```rust
+/// Create VMSA (execution context information) for an AP
+fn create_svsm_vmsa(for_id: usize) -> VirtAddr {
+    // 分配一个用于存放vmsa的地址空间
+    let frame: PhysFrame = alloc_vmsa();
+    let vmsa_va: VirtAddr = pgtable_pa_to_va(frame.start_address());
+    let vmsa: *mut Vmsa = vmsa_va.as_mut_ptr();
+    // 创建gdt，idt表，并为每个CPU的地址
+    let gdtr: DescriptorTablePointer = sgdt();
+    let idtr: DescriptorTablePointer = sidt();
+    let gs: VirtAddr = percpu_address(for_id);
+    let tss: VirtAddr = tss_init_for(for_id);
+
+    unsafe {
+        (*vmsa).set_cs_selector(get_gdt64_kernel_cs() as u16);
+        (*vmsa).set_cs_rtype(SVSM_CS_TYPE);
+        (*vmsa).set_cs_limit(SVSM_CS_LIMIT);
+        (*vmsa).set_cs_base(SVSM_CS_BASE);
+
+        (*vmsa).set_tr_selector(get_gdt64_tss() as u16);
+        (*vmsa).set_tr_rtype(SVSM_TSS_TYPE);
+        (*vmsa).set_tr_limit(size_of::<TaskStateSegment>() as u32 - 1);
+        (*vmsa).set_tr_base(tss.as_u64());
+
+        (*vmsa).set_gs_base(gs.as_u64());
+
+        (*vmsa).set_rip(get_cpu_start());
+
+        (*vmsa).set_gdtr_limit(gdtr.limit as u32);
+        (*vmsa).set_gdtr_base(gdtr.base.as_u64());
+
+        (*vmsa).set_idtr_limit(idtr.limit as u32);
+        (*vmsa).set_idtr_base(idtr.base.as_u64());
+
+        (*vmsa).set_cr0(SVSM_CR0);
+        (*vmsa).set_cr3(Cr3::read().0.start_address().as_u64());
+        (*vmsa).set_cr4(SVSM_CR4);
+        (*vmsa).set_efer(SVSM_EFER);
+        (*vmsa).set_rflags(SVSM_RFLAGS);
+        (*vmsa).set_dr6(SVSM_DR6);
+        (*vmsa).set_dr7(SVSM_DR7);
+        (*vmsa).set_gpat(SVSM_GPAT);
+        (*vmsa).set_xcr0(SVSM_XCR0);
+        (*vmsa).set_mxcsr(SVSM_MXCSR);
+        (*vmsa).set_x87_ftw(SVSM_X87_FTW);
+        (*vmsa).set_x87_fcw(SVSM_X87_FCW);
+
+        (*vmsa).set_vmpl(VMPL::Vmpl0 as u8);
+        (*vmsa).set_sev_features(rdmsr(MSR_SEV_STATUS) >> 2);
+    }
+
+    vmsa_va
+}
+```
+
+最后一个函数如下所示：
+```rust
+pub fn vc_ap_create(vmsa_va: VirtAddr, apic_id: u32) {
+    let ghcb: *mut Ghcb = vc_get_ghcb();
+    let vmsa: *const Vmsa = vmsa_va.as_u64() as *const Vmsa;
+
+    unsafe {
+        let info1: u64 =
+            GHCB_NAE_SNP_AP_CREATION_REQ!(SNP_AP_CREATE_IMMEDIATE, (*vmsa).vmpl(), apic_id);
+        let info2: u64 = pgtable_va_to_pa(vmsa_va).as_u64();
+
+        (*ghcb).set_rax((*vmsa).sev_features());
+
+        vc_perform_vmgexit(ghcb, GHCB_NAE_SNP_AP_CREATION, info1, info2);
+
+        (*ghcb).clear();
+    }
+}
+```
+在一切准备就绪的情况下，需要通过`Virtual Communication`来让`hypervisor`所知道需要处理这些要求。
+
+至此，该函数的解读任务便结束了。
