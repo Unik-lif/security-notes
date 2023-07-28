@@ -9,6 +9,9 @@
 至于`vc`的初始化，我们可以看到其基本框架如下：
 ```rust
 pub fn vc_init() {
+    // early ghcb 中存放着ghcb的地址位置
+    // 当然，get_early_ghcb中ealry_ghcb存放的是虚拟地址，含有0xffff800000000000的偏移量
+    // 不过pgtable_va_to_pa将会直接去掉前面这一大部分的偏移量
     let ghcb_pa: PhysAddr = pgtable_va_to_pa(get_early_ghcb());
 
     vc_establish_protocol();
@@ -65,8 +68,10 @@ fn vc_establish_protocol() {
 
     // 对于返回的data值，检查其中的flag，必须要求其中的某一部分存在：
     // bit 0，bit 1两个部分是一定要存在的，其他无所谓
+    // SNP 与 SNP AP Creation需要被支持
     // 不太清楚bit 4为什么也算在flag之中，我在GHCB中没有看到这个指示
     // 但是feature位本身就有52个bit，可能是有新的协议规定了bit 4作为SVSM的支持指示
+    // GHCB Specification中尚没有添加这个东西
     if (GHCB_MSR_HV_FEATURES!(response) & GHCB_SVSM_FEATURES) != GHCB_SVSM_FEATURES {
         vc_terminate_ghcb_feature();
     }
@@ -91,6 +96,7 @@ fn vc_msr_protocol(request: u64) -> u64 {
     wrmsr(MSR_GHCB, request);
     // rep vmmcall
     // 更新了MSR_GHCB的值之后，需要通过VMMCALL让hypervisor知晓，请与GHCB块进行交互，
+    // 跳出我们的Guest OS世界
     vc_vmgexit();
     response = rdmsr(MSR_GHCB);
 

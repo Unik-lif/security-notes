@@ -1,5 +1,5 @@
 ## 有关于函数tss_init的分析
-我们在这一章尝试分析`percpu_init`函数。
+我们在这一章尝试分析`tss_init`函数。
 ```rust
 /// Create and load TSS.
 /// Only used by the BSP, since APs can use tss_init_for()

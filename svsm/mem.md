@@ -45,7 +45,7 @@ unsafe fn __mem_init() {
 ```rust
 // 该函数把Ghcb记作一个可变项
 pub fn vc_early_make_pages_private(begin: PhysFrame, end: PhysFrame) {、
-    // 搞到early_ghcb地址，准备修改它
+    // 搞到early_ghcb中的ghcb地址，准备修改它
     let ghcb: *mut Ghcb = get_early_ghcb().as_mut_ptr() as *mut Ghcb;
 
     // 尝试把begin和end区域内的信息拷贝到ghcb中
@@ -351,6 +351,7 @@ pub fn init_memory(&mut self) {
 
     /* Mark all pages as allocated */
     // 其余的部分被设置为被分配的状态，order表示的是buddy system中的粒度
+    // 当然，全部都在访问metadata_page部分的内容
     for i in meta_pages..self.page_count {
         let pg: SvsmPageInfo = SvsmPageInfo::Allocated(AllocatedInfo { order: 0 });
         self.write_page_info(i, pg);
@@ -359,6 +360,7 @@ pub fn init_memory(&mut self) {
     /* Now free all pages */
     // 一开始buddy_system还没有对内存进行合并时，均存放在order 0之中
     // 接下来需要通过free_page_order来尝试对相关的内存进行合并
+    // 这是buddy_system中的用法
     // 注意：在开始的时候，这些SVSMPageInfo状态都被设置成了Allocated
     for i in meta_pages..self.page_count {
         self.free_page_order(i, 0);
@@ -373,7 +375,7 @@ fn write_page_info(&self, pfn: usize, pi: SvsmPageInfo) {
     // to_mem将会把svsm page info转变为page storage type类型信息
     let info: PageStorageType = pi.to_mem();
     unsafe {
-        // 先进行地址转换
+        // 先进行地址转换，当然去找的是metadata_page内的用于存放类型的位置
         let ptr: *mut PageStorageType =
             self.page_info_virt_addr(pfn).as_u64() as *mut PageStorageType;
         // 再进行信息存储

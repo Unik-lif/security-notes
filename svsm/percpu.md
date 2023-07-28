@@ -67,8 +67,8 @@ unsafe fn __percpu_init(init_frame: PhysFrame, init_count: u64) -> u64 {
     PERCPU.set_ghcb(va);
 
     // Retrieve the list of APIC IDs
-    // 这个id似乎是从vc_cpuid之中获取出来的
-    // 利用apic_id获得BSP的处理器核心ID标志符号
+    // cpuid: fn 0000_000b 且 rcx 为 0 时的子函数
+    // 通过rdx得到当前BSP的APIC_ID号
     let bsp_apic_id: u32 = get_apic_id();
 
     // 通过bsp_apic_id号得到全部的apic_ids，反映ap对应的id号们
@@ -149,20 +149,21 @@ pub fn vc_get_apic_ids(bsp_apic_id: u32) -> Vec<u32> {
         if !(*ghcb).is_rax_valid() {
             vc_terminate_svsm_resp_invalid();
         }
-
+        // 一共有 rax 个核心
+        // 每个核心要分配一个页用来使用
         pages = (*ghcb).rax();
 
         (*ghcb).clear();
     }
-    // rax中似乎存放了要及格pages来存放的信息
+    
     let frame: PhysFrame = match mem_allocate_frames(pages) {
         Some(f) => f,
         None => vc_terminate_svsm_enomem(),
     };
-    // va数目由pa来确定，pa数目由frame的起始地址来确定？
+    // va数目由pa来确定，pa数目由frames起始位置来决定
     let pa: PhysAddr = frame.start_address();
     let va: VirtAddr = pgtable_pa_to_va(pa);
-    // 将pages所对应的一部分区域设置为shared类型
+    // 将va开始的这么一大块页设置为shared状态
     pgtable_make_pages_shared(va, pages * PAGE_SIZE);
     memset(va.as_mut_ptr(), 0, (pages * PAGE_SIZE) as usize);
 
@@ -181,6 +182,8 @@ pub fn vc_get_apic_ids(bsp_apic_id: u32) -> Vec<u32> {
 
         (*ghcb).clear();
         // count数目由va来确定
+        // 既然已经在之前通过memset来做了，那么只有一种可能了，在GHCB_NAE_GET_APIC_IDS这个协议中，pa作为参数改变了va存储的值
+        // 否则我们无法得知为何*count会发生改变并被设置成特殊的值
         let count: *const u32 = va.as_u64() as *const u32;
 
         if *count == 0 || *count > 4096 {
@@ -202,7 +205,7 @@ pub fn vc_get_apic_ids(bsp_apic_id: u32) -> Vec<u32> {
         assert_eq!(apic_ids.len(), *count as usize);
     }
     // 为什么va可以用来表示apic_ids的count数，还需要进一步认证
-    // 需要完全搞清楚GHCB_NAE_GET_APIC_IDS这个协议究竟做了什么
+    // 需要完全搞清楚GHCB_NAE_GET_APIC_IDS这个协议究竟做了什么，不过我现在看懂了差不多
     pgtable_make_pages_private(va, pages * PAGE_SIZE);
     mem_free_frames(frame, pages);
 

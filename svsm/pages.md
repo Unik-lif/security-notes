@@ -340,7 +340,7 @@ unsafe fn __pgtable_init(flags: PageTableFlags, allocator: &mut PageTableAllocat
     }
 
     // Change the early GHCB to shared for use before a new one is created
-    // 一开始的GHCB被设置成了RESCINDE类型
+    // 一开始的GHCB被设置成了RESCIND类型
     let va: VirtAddr = get_early_ghcb();
     let page: Page<Size4KiB> = page_with_addr(va);
     remap_page(page, PageType::Shared, false);
@@ -376,6 +376,8 @@ unsafe fn __pgtable_init(flags: PageTableFlags, allocator: &mut PageTableAllocat
     let p4_pa: PhysAddr = PhysAddr::new(pgtable_va_to_pa(p4).as_u64() | get_sev_encryption_mask());
     let cr3: PhysFrame = PhysFrame::containing_address(p4_pa);
     // cr3 自然会被写为page table起始位置
+    // 实际上到这一步才真正利用页表进行管理
+    // 先前在start.S中的页表是手搓出来的，我感觉可能也没有什么特别大的用处
     Cr3::write(cr3, Cr3Flags::empty());
 }
 ```

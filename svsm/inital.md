@@ -37,7 +37,7 @@ fn check_vmpl_level() {
     //
     // Attempt to clear the VMPL1 attributes of the early GHCB page.
     // 如同注释所述：仅有VMPL0才有权限能够去修改VMPL1对于某个页的操作权限
-    // 可能值得探讨的地方：手册上似乎说VMPL1也可以去懂VMPL2和VMPL3之类的，或许可以考虑写demo测试一下
+    // 可能值得探讨的地方：手册上似乎说VMPL1也可以去动VMPL2和VMPL3之类的，或许可以考虑写demo测试一下
     // 
     // vc_terminate是紫砂指令，会终止我们的任务。
     
@@ -116,4 +116,4 @@ fn check_svsm_address() {
 
 到这边，第一步的检查就完成了。
 
-### 总结，第一步检查了一些基本的权限设置、权限对应的`features`是否得到满足、`svsm`的地址是否得到了对齐这三种基本属性。
+### 总结，第一步检查了一些基本的权限设置、权限对应的`features`是否得到满足、`svsm`的地址是否得到了对齐且合法这三种基本属性。
