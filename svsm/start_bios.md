@@ -26,7 +26,7 @@ fn prepare_bios() {
     };
     // 利用bios_map建立bios_info，guid table此时也是new完的状态
     let mut bios_info: BiosInfo = BiosInfo::new(bios_map.va(), bios_size);
-    // 设置guid_table，根据bios_info信息的一些已有，对bios_info.guid_table做好设置
+    // 设置guid_table，根据bios_info的一些已有信息，对bios_info.guid_table做好设置
     // 同时涉及一部分验证操作
     if !parse_bios_guid_table(&mut bios_info) {
         vc_terminate_svsm_bios();
@@ -277,6 +277,7 @@ unsafe fn advertise_svsm_presence(bios_info: &mut BiosInfo, caa: PhysAddr) -> bo
     bios_secrets.clear_vmpck0();
 
     // Advertise the SVSM
+    // SVSM所对应的bios_secrets看来是建立在VMPL1之上的
     bios_secrets.set_svsm_base(pgtable_va_to_pa(get_svsm_begin()).as_u64());
     bios_secrets.set_svsm_size(get_svsm_end().as_u64() - get_svsm_begin().as_u64());
     bios_secrets.set_svsm_caa(caa.as_u64());
@@ -317,7 +318,9 @@ pub fn smp_prepare_bios_vmpl(caa_pa: PhysAddr) -> bool {
         Ok(v) => v,
         Err(_e) => return false,
     };
-    // 利用函数__create_bios_vmsa
+    // 利用函数__create_bios_vmsa，从vmsa的起始虚拟地址开始执行
+    // 现在为bsp创建了一个vmpl设置为vmpl1级别的vmsa
+    // 现在需要在PERCPU中把这个东西设置在vmpl1位置处
     unsafe { __create_bios_vmsa(vmsa.va()) }
 
     let caa: MapGuard = match MapGuard::new_private(caa_pa, CAA_MAP_SIZE) {
@@ -325,6 +328,7 @@ pub fn smp_prepare_bios_vmpl(caa_pa: PhysAddr) -> bool {
         Err(_e) => return false,
     };
 
+    // 设置caa空间和刚刚利用create_bios_vmsa创建的vmsa于VMPL1之上
     unsafe {
         PERCPU.set_vmsa(vmsa_pa, VMPL::Vmpl1);
         PERCPU.set_caa(caa_pa, VMPL::Vmpl1);
@@ -340,11 +344,12 @@ pub fn smp_prepare_bios_vmpl(caa_pa: PhysAddr) -> bool {
     //
     // The lower VMPL has not been run, yet, so no TLB flushing is needed.
     //
+    // 设置bsp对应的处在vmpl1的caa空间为在VMPL1权限中可以VMPL_RWX的类型
     let ret: u32 = rmpadjust(caa.va().as_u64(), RMP_4K, VMPL_RWX | VMPL::Vmpl1 as u64);
     if ret != 0 {
         return false;
     }
-
+    // 设置vmsa为在VMPL1权限下仅仅可以去Read的类型
     let ret: u32 = rmpadjust(vmsa.va().as_u64(), RMP_4K, VMPL_R | VMPL::Vmpl1 as u64);
     if ret != 0 {
         return false;
@@ -352,6 +357,7 @@ pub fn smp_prepare_bios_vmpl(caa_pa: PhysAddr) -> bool {
 
     let vmin: u64 = VMPL::Vmpl2 as u64;
     let vmax: u64 = VMPL::VmplMax as u64;
+    // 对于其他的权限，仅用rmpadjust表面上过一遍，明确告知它们没有权限操作caa和vmsa空间
     for i in vmin..vmax {
         let ret: u32 = rmpadjust(caa.va().as_u64(), RMP_4K, i);
         if ret != 0 {
@@ -363,13 +369,16 @@ pub fn smp_prepare_bios_vmpl(caa_pa: PhysAddr) -> bool {
             return false;
         }
     }
-
+    // 除了READ以外，还告知vmsa.va开始的一块内存空间将会被用于当做VMSA
+    // 参考手册中RMPADJUST指令信息
     let ret: u32 = rmpadjust(vmsa.va().as_u64(), RMP_4K, VMPL_VMSA | VMPL::Vmpl1 as u64);
     if ret != 0 {
         return false;
     }
 
     unsafe {
+        // 利用GS寄存器，将当前vmsa_pa和apic_id当做元素，添加到VMSA_LIST之中进行管理
+        // 特别的，BSP对应的PERCPU信息恰好是PERCPU，所以可以直接这么用偏移量来计算
         svsm_request_add_init_vmsa(vmsa_pa, PERCPU.apic_id());
     }
 
@@ -386,7 +395,11 @@ unsafe fn __create_bios_vmsa(vmsa_va: VirtAddr) {
 
     // Copy the measured BIOS BSP VMSA page
     // 直接将原来在start.S中data段所包含的bsp_page拷贝到我们新分配的vmsa之中
-    // 因此要看bsp_page的事情
+    // 因此要看bsp_page具体是怎么设置的
+    // 然而在代码中并没有找到关于bsp_page的设置相关，猜测是固件上就已经满足了这些要求
+    // 这就和读取snp_pages得到的bios_secret相关信息的原理一样
+    // 最终的结果反正是：bsp_vmsa_page之中存放着vmpl1的vmsa信息，二者进行了地址拷贝，里头到底存放着什么东西我们不知道
+    // 从其他函数的操作流程中印证了这一猜想
     *vmsa = *bsp_page;
 
     if (*vmsa).vmpl() != VMPL::Vmpl1 as u8 {
@@ -407,3 +420,47 @@ unsafe fn __create_bios_vmsa(vmsa_va: VirtAddr) {
     }
 }
 ```
+在运行完函数`smp_prepare_bios_vmpl`之后，我们的`VMPL`相关的东东在`BSP`的层面至少已经完成初始化操作了，现在可以尝试进入函数`smp_run_bios_vmpl`，它如下所示：
+```rust
+/// Retrieve Vmpl1 Vmsa and start it
+pub fn smp_run_bios_vmpl() -> bool {
+    unsafe {
+        // Retrieve VMPL1 VMSA and start it
+        let vmsa_pa: PhysAddr = PERCPU.vmsa(VMPL::Vmpl1);
+        if vmsa_pa == PhysAddr::zero() {
+            return false;
+        }
+
+        let vmsa_map: MapGuard = match MapGuard::new_private(vmsa_pa, PAGE_SIZE) {
+            Ok(r) => r,
+            Err(_e) => return false,
+        };
+
+        vc_ap_create(vmsa_map.va(), PERCPU.apic_id());
+    }
+
+    true
+}
+```
+简而言之，其从`BSP`所对应的`PERCPU`中获取了`Vmpl1`的物理地址，为它建立`MapGuard`且`private`结构，采用`vc_ap_create`函数做结尾，从而让`BSP`之后也能成为一个`AP`。
+```rust
+pub fn vc_ap_create(vmsa_va: VirtAddr, apic_id: u32) {
+    let ghcb: *mut Ghcb = vc_get_ghcb();
+    let vmsa: *const Vmsa = vmsa_va.as_u64() as *const Vmsa;
+
+    unsafe {
+        let info1: u64 =
+            GHCB_NAE_SNP_AP_CREATION_REQ!(SNP_AP_CREATE_IMMEDIATE, (*vmsa).vmpl(), apic_id);
+        let info2: u64 = pgtable_va_to_pa(vmsa_va).as_u64();
+
+        (*ghcb).set_rax((*vmsa).sev_features());
+
+        vc_perform_vmgexit(ghcb, GHCB_NAE_SNP_AP_CREATION, info1, info2);
+
+        (*ghcb).clear();
+    }
+}
+```
+我们在上面看到了一个相对完整的建立`VMPL1`，修改其他权限级，获取`vmsa`页（通过`MapGuard`来做），以及通过`GHCB_NAE_SNP_AP_CREATION`协议建立`ap`的完整流程。
+
+至此，本章的代码解读结束。
