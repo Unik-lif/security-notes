@@ -8,16 +8,12 @@
 3. `waiting`队列：表示之后需要拿去处理的请求，在进行`add_request`操作之后，所有的请求默认先放在这边，之后适时向前两个拥有更高优先级的请求做发射
 
 
-有一个东西似乎还没有搞清楚。。。即logical_blocks？
-
-先歇一会儿，做一会儿Lab吧。
-
 一个请求进入后的状态变化关系图：
 ```
 request processing route: 
 
               allocate: allocate gpu physical               _append_slot: logical_blocks?
-              blocks due to logical_token_blocks length     
+              blocks due to logical_token_blocks length     generate new block according to copy-on-write
 waiting List -------------------------------> running List -------->
                                                    |   ^
                                          swap out  |   |
@@ -26,6 +22,11 @@ waiting List -------------------------------> running List -------->
                               |------------------------>
                                   
 ```
+看的出来，块的分配遵循两个步骤，一阶段是针对`seq_group`中的`seqs`分配`logical_blocks`，只分配一组，`beam search`中对应的其他`seq`会通过浅拷贝的方式来接上（浅拷贝在`rust`和`c++`中很常用）。
+
+二阶段可以理解成`CD`好了开大招`R`，会根据最后一个`block`的引用次数来决定替换最后一块的情况。当然，作为反映输入`input`的块它的引用次数一直都会比较高，所以`_append_slot`可以算是程序真正跑起来之后会发生的事情。在`schedule`的第一次调用时，所有的请求，即`seq_groups`都会处于`waiting list`之中，这一次调用后的结局是，他们只会塞到`running list`中，但是还没有经历到第二阶段。
+
+特别需要注意到是，`running list`中存在两种类型的`seq_groups`，分别是一阶段和二阶段。
 ### _schedule函数
 在函数`_schedule`中，反映了对于`swapped`块做的一些操作：
 ```python
@@ -347,6 +348,7 @@ waiting List -------------------------------> running List -------->
         logical_blocks = seq.logical_token_blocks
         block_table = self.block_tables[seq.seq_id]
         # 我感觉一般这种情况不会出现，先前block_table分配空间的时候，就是按照logical_blocks数目来的
+        # 或者说，在跑起来之后才有可能出现
         if len(block_table) < len(logical_blocks):
             # The sequence has a new logical block.
             # Allocate a new physical block.
@@ -370,7 +372,52 @@ waiting List -------------------------------> running List -------->
 
 ```
 
-## 一些问题：
+### 一些问题：
 不过对于这两个`allocate`以及`append_slot`为什么要这么做，以及`blocks_to_copy`的相关细节还是缺乏了解，可能得重新看一下文献，了解一下这边所说的`copy-on-write`机制。
 
-感觉`append_slot`不管从哪个方向去看都非常诘屈聱牙
+感觉`append_slot`不管从哪个方向去看都非常诘屈聱牙？
+
+刚刚看了一眼论文，似乎可以理解了。
+
+`seq_group`中存放的`seqs`都是一样的，作为`input`来看待，在跑`append_slot`之前，`beam search`现在其实还没有开始，只不过先给它预留了一些块。现在往下生成时，会通过`copy-on-write`方式向下生成，所以是从最后一位来看，看其的`ref_count`是否为`1`，然后对应的需要拷贝的块会存放到`blocks_to_copy`之中（其实它先前的块可能也需要拷贝，但是在这边似乎还没体现出来，可能在下一个步骤中出现？）
+
+先前的块复制是浅拷贝，从这里可以看出`cop-on-write`的思想，不过由于东西还没完全跑起来看，我们需要赶紧去看`schedule`之后的步骤了。
+
+### schedule函数
+上面对`_schedule`函数做了较为详细的分析，现在我们看看外面的函数：
+```python
+    def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
+        # Schedule sequence groups.
+        # This function call changes the internal states of the scheduler
+        # such as self.running, self.swapped, and self.waiting.
+
+        # _schedule函数返回了由blocks_to_swap_in/out, blocks_to_copy组成的调度结果
+        # 以及从waiting list弹出来的seq_group信息
+        scheduler_outputs, prompt_group_ids = self._schedule()
+
+        # Create input data structures.
+        seq_group_metadata_list: List[SequenceGroupMetadata] = []
+        for seq_group in self.running:
+            is_prompt = seq_group.request_id in prompt_group_ids
+
+            seq_data: Dict[int, List[SequenceData]] = {}
+            block_tables: Dict[int, List[int]] = {}
+            # 总之似乎遍历了running list中seq_group中全部seq
+            # 存储了他们的seq_data与对应的block_tables信息
+            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                seq_id = seq.seq_id
+                seq_data[seq_id] = seq.data
+                block_tables[seq_id] = self.block_manager.get_block_table(seq)
+            # 根据上面那么多的东西包起来了一个seq_group_metadata数据
+            seq_group_metadata = SequenceGroupMetadata(
+                request_id=seq_group.request_id,
+                # 这个seq_group是否涉及从waiting list弹出请求进入到更高优先级之中？
+                is_prompt=is_prompt,
+                seq_data=seq_data,
+                sampling_params=seq_group.sampling_params,
+                block_tables=block_tables,
+            )
+            seq_group_metadata_list.append(seq_group_metadata)
+        return seq_group_metadata_list, scheduler_outputs
+```
+看起来他的行为还是比较简单的，我们再看看这个函数返回到了哪里去？这一则博客到这边也就结束了。
