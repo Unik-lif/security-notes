@@ -81,6 +81,8 @@ waiting List -------------------------------> running List -------->
                     break
             else:
                 # Append new slots to the sequence group.
+                # 如果gpu_allocator有充足的blocks让seq_group进入二阶段
+                # 那么直接通过_append_slot分配给其二阶段所需要的资源，并在running数组中加上seq_group
                 self._append_slot(seq_group, blocks_to_copy)
                 running.append(seq_group)
         self.running = running
@@ -188,3 +190,183 @@ waiting List -------------------------------> running List -------->
         }
         return block_number_mapping
 ```
+现在我们看向函数`_schedule`的第二部分，对于`swapped`队列的处理。
+```python
+        # Swap in the sequence groups in the SWAPPED state if possible.
+        # 对swapped队列进行排序
+        self.swapped = self.policy.sort_by_priority(now, self.swapped)
+        # 如果swapped队列中有值，并且此时blocks_to_swap_out中没有值
+        while self.swapped and not blocks_to_swap_out:
+            seq_group = self.swapped[0]
+            # If the sequence group has been preempted in this step, stop.
+            if seq_group in preempted:
+                break
+            # If the sequence group cannot be swapped in, stop.
+            # can_swap_in => gpu_allocator free.
+            if not self.block_manager.can_swap_in(seq_group):
+                break
+
+            # The total number of sequences in the RUNNING state should not
+            # exceed the maximum number of sequences.
+            num_new_seqs = seq_group.num_seqs(status=SequenceStatus.SWAPPED)
+            num_curr_seqs = len(self.running)
+            # 看样子这里是有bug的
+            # 原因也很简单，类型搞错了，前面的是一个seq_group中的seqs数目
+            # 后面是seq_groups总数
+            if num_curr_seqs + num_new_seqs > self.scheduler_config.max_num_seqs:
+                break
+
+            seq_group = self.swapped.pop(0)
+            self._swap_in(seq_group, blocks_to_swap_in)
+            self._append_slot(seq_group, blocks_to_copy)
+            self.running.append(seq_group)
+
+        num_batched_tokens = sum(
+            seq_group.num_seqs(status=SequenceStatus.RUNNING)
+            for seq_group in self.running
+        )
+```
+`swapped`进入二阶段的优先级比较低，如果先前`blocks_to_swap_out`中已经有了项，那么就不进行`swap`处理，这个也比较好理解，如果`blocks_to_swap_out`中有值，说明`gpu_allocator`中的空余块并不足够，在这种情况下还想着`swap_in`去使用`gpu_allocator`中的资源，只会造成资源更大的缺口。
+
+剩下的感觉比较好理解，`swapp_in`还会更新`seq`状态，之后就可以通过`_append_slot`开二阶段，塞到`running list`之中。
+
+之后维护了一个`num_batched_tokens`，现在这个队列中可以视作全部都开了二阶段的`seq_groups`构成的批处理块，记录了这边`seqs`数目的总和。不过根据后面的观察，似乎这边也有一个`bug`，`num_batched_tokens`记录了`seqs`数目，而不是`tokens`数目。
+
+在`swapped`队列被处理好后，我们看向`waiting`队列。这个队列必须要在`swapped`队列之中彻底没有值了以后，才会被拿来处理。在`schedule`刚开始的阶段，这种情景是适用的。
+```python
+        # Join waiting sequences if possible.
+        # prompt队列被用于记录从waiting list之中弹出，提高了优先级而被放入swapped和running队列中的seq_group
+        prompt_group_ids: List[str] = []
+        # NOTE(woosuk): The sequence groups in the SWAPPED state are strictly
+        # prioritized over the sequence groups in the WAITING state.
+        # This is because we want to bound the amount of CPU memory taken by
+        # the swapped sequence groups.
+        if not self.swapped:
+            # Optimization: We do not sort the waiting queue since the preempted
+            # sequence groups are added to the front and the new sequence groups
+            # are added to the back.
+            while self.waiting:
+                seq_group = self.waiting[0]
+                # If the sequence group has been preempted in this step, stop.
+                # 感觉似乎没有这种可能性？
+                if seq_group in preempted:
+                    break
+                # If the sequence group cannot be allocated, stop.
+                # 没有足够空间进行allocate让waiting list中的seq_group进入一阶段
+                if not self.block_manager.can_allocate(seq_group):
+                    break
+
+                # If the number of batched tokens exceeds the limit, stop.
+                # 一次只能处理max_num_batched_tokens这么多的tokens
+                # 这边似乎也有一个存疑的bug，或许我对num_batched_tokens的理解存在偏差
+                num_prompt_tokens = seq_group.get_seqs()[0].get_len()
+                if (num_batched_tokens + num_prompt_tokens
+                    > self.scheduler_config.max_num_batched_tokens):
+                    break
+
+                # The total number of sequences in the RUNNING state should not
+                # exceed the maximum number of sequences.
+                # 先前提到的bug在这边重复出现了
+                num_new_seqs = seq_group.num_seqs(status=SequenceStatus.WAITING)
+                num_curr_seqs = len(self.running)
+                if num_curr_seqs + num_new_seqs > self.scheduler_config.max_num_seqs:
+                    break
+
+                seq_group = self.waiting.pop(0)
+                # 开启一阶段，但是还没有开启二阶段
+                # 同样是running，有些running开启了一阶段，有些running则开启了二阶段
+                self._allocate(seq_group)
+                self.running.append(seq_group)
+                num_batched_tokens += num_prompt_tokens
+                prompt_group_ids.append(seq_group.request_id)
+
+        scheduler_outputs = SchedulerOutputs(
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_copy=blocks_to_copy,
+        )
+        if not self.log_stats:
+            return scheduler_outputs, prompt_group_ids
+```
+既然看到这边了，我们应该仔细来考虑一下一阶段和二阶段之间的不同之处了：
+
+首先一阶段对应着`_allocate`函数，该函数似乎对`seq_group`只进行一次分配：也就是一个`seq_group`对应一次`allocate`分配。
+```python
+    def _allocate(self, seq_group: SequenceGroup) -> None:
+        self.block_manager.allocate(seq_group)
+        for seq in seq_group.get_seqs():
+            seq.status = SequenceStatus.RUNNING
+```
+对于`allocate`函数做分析。
+```python
+    def allocate(self, seq_group: SequenceGroup) -> None:
+        # NOTE: Here we assume that all sequences in the group have the same prompt.
+        # 思路可能还是Copy on Write，虽然一个seq_group中的seqs是通过tokenizer处理后
+        # 有可能有所不同的seq，但是可能还是存在较大的重合部分
+        # 这边通过采样，选取第一个seq
+        seq = seq_group.get_seqs()[0]
+
+        # Allocate new physical token blocks that will store the prompt tokens.
+        block_table: BlockTable = []
+        # 总之为每个logcial_token_block都分配一个block与之进行对应
+        # 初始化的时候，默认每个seq所产生的block都与第一个一样，所以在这边会把ref_count一并记作beam search所对应的top-k个
+        for _ in range(len(seq.logical_token_blocks)):
+            block = self.gpu_allocator.allocate()
+            # Set the reference counts of the token blocks.
+            block.ref_count = seq_group.num_seqs()
+            # 记录gpu_allocator所指定的那些block
+            block_table.append(block)
+
+        # Assign the block table for each sequence.
+        # 在block_tables中设置seq所对应的block_table均为同一组
+        for seq in seq_group.get_seqs():
+            self.block_tables[seq.seq_id] = block_table.copy()
+```
+对于二阶段的`append_slot`函数做分析：这个函数对于`running`状态的`seq`做操作
+```python
+    def _append_slot(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> None:
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            ret = self.block_manager.append_slot(seq)
+            if ret is not None:
+                # last_block_number, new_block_number
+                src_block, dst_block = ret
+                if src_block in blocks_to_copy:
+                    blocks_to_copy[src_block].append(dst_block)
+                else:
+                    blocks_to_copy[src_block] = [dst_block]
+```
+
+```python
+    def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
+        """Allocate a physical slot for a new token."""
+        # block_table基于之前的allocate，因此append_slot被我称为二阶段
+        logical_blocks = seq.logical_token_blocks
+        block_table = self.block_tables[seq.seq_id]
+        # 我感觉一般这种情况不会出现，先前block_table分配空间的时候，就是按照logical_blocks数目来的
+        if len(block_table) < len(logical_blocks):
+            # The sequence has a new logical block.
+            # Allocate a new physical block.
+            block = self.gpu_allocator.allocate()
+            block_table.append(block)
+            return None
+
+        # We want to append the token to the last physical block.
+        last_block = block_table[-1]
+        assert last_block.device == Device.GPU
+        if last_block.ref_count == 1:
+            # Not shared with other sequences. Appendable.
+            return None
+        else:
+            # The last block is shared with other sequences.
+            # Copy on Write: Allocate a new block and copy the tokens.
+            new_block = self.gpu_allocator.allocate()
+            block_table[-1] = new_block
+            self.gpu_allocator.free(last_block)
+            return last_block.block_number, new_block.block_number
+
+```
+不过对于这两个`allocate`以及`append_slot`为什么要这么做，以及`blocks_to_copy`的相关细节还是缺乏了解，可能得重新看一下文献，了解一下这边所说的`copy-on-write`机制。
