@@ -1,5 +1,5 @@
 ## 概览
-在这一篇博客中我们集中精力尝试分析`vLLM`项目中的`swap`机制，意思为在`cpu_blocks`与`gpu_blocks`之间进行交换的过程。
+在这一篇博客中我们集中精力尝试分析`vLLM`项目中的`swap`机制，这个主要是`scheduler`来干，意思为在`cpu_blocks`与`gpu_blocks`之间进行交换的过程。
 
 ## 分析
 `swap`过程发生在`LLM Engine`调用`run_engine`之后，利用`schedule`函数对`scheduler`调度器内存放的三个请求队列的操作，这三个队列分别为：
@@ -322,7 +322,7 @@ waiting List -------------------------------> running List -------->
         for seq in seq_group.get_seqs():
             self.block_tables[seq.seq_id] = block_table.copy()
 ```
-对于二阶段的`append_slot`函数做分析：这个函数对于`running`状态的`seq`做操作
+对于二阶段的`_append_slot`函数做分析：这个函数对于`running`状态的`seq`做操作
 ```python
     def _append_slot(
         self,
@@ -339,7 +339,7 @@ waiting List -------------------------------> running List -------->
                 else:
                     blocks_to_copy[src_block] = [dst_block]
 ```
-
+对应的函数为`append_slot`，如果尾`token`被多次`ref`，则替换其为独立的一个。
 ```python
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
@@ -369,4 +369,8 @@ waiting List -------------------------------> running List -------->
             return last_block.block_number, new_block.block_number
 
 ```
+
+## 一些问题：
 不过对于这两个`allocate`以及`append_slot`为什么要这么做，以及`blocks_to_copy`的相关细节还是缺乏了解，可能得重新看一下文献，了解一下这边所说的`copy-on-write`机制。
+
+感觉`append_slot`不管从哪个方向去看都非常诘屈聱牙
