@@ -330,6 +330,7 @@ waiting List -------------------------------> running List -------->
         seq_group: SequenceGroup,
         blocks_to_copy: Dict[int, List[int]],
     ) -> None:
+        # 记录由于copy-on-write而出现的
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             ret = self.block_manager.append_slot(seq)
             if ret is not None:
@@ -368,6 +369,7 @@ waiting List -------------------------------> running List -------->
             new_block = self.gpu_allocator.allocate()
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
+            # last_block是被替换的block，而new_block是用来替换的block
             return last_block.block_number, new_block.block_number
 
 ```
