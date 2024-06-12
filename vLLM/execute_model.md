@@ -102,6 +102,7 @@ def step(self) -> List[RequestOutput]:
         )
         return output
 ```
+#### cache
 我们需要具体观察三个`cache_engine`操作函数，我们依此来做这件事情，首先`swap_in`与`swap_out`这两个行为是对称的，所以我们可以省下一些力气。
 ```python
     # 从cpu_cache出发，swap_in放到gpu_cache之中
@@ -292,7 +293,9 @@ void copy_blocks(
   key_cache_ptrs_tensor.data_ptr<int64_t>()、value_cache_ptrs_tensor.data_ptr<int64_t>() 和 block_mapping_tensor.data_ptr<int>()：这些是从之前代码中创建的 PyTorch 张量中获取数据指针的方法。这些指针将作为核函数的参数传递给 vllm::copy_blocks_kernel。 
   */
 
-  const int numel_per_block = key_caches[0][0].numel();
+  const int numel_per_block = key_caches[0][0].numel(); 
+  // row: num_layers, column: num_pairs
+  // grid: a num_layers * num_pairs blocks matrix.
   dim3 grid(num_layers, num_pairs);
   dim3 block(std::min(1024, numel_per_block));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -311,7 +314,7 @@ void copy_blocks(
 ```
 现在我们尝试来分析做分发处理的函数`copy_blocks_kernel`，这个函数输入了`key_cache`、`value_cache`等信息，其根据`blockIdx`来确定当前的层数`index`和`mapping`中的`pair index`，但这边的`blockIdx`是什么，目前暂不知。总体来看，`blockIdx`对应的是`grid`，反映了网格大小，并且`grid`存放了`layer_idx`总量和`pair_idx`总量信息。
 
-考虑到`CUDA`本身的并行化性质，可以合理推测下面的函数是把原本的工作分解成了仅针对于`layer_idx`这一层的拷贝工作？
+这边我去快速学习了一下`15-418`课程针对`CUDA`的一些原语设置和`terminology`的观察，理解起来确实没啥问题，不过值得注意的是这边的`key_cache`与`value_cache`的数据排布方式与`grid`这个二维数组存在一定程度上的不同，需要注意区分。
 ```cpp
 namespace vllm {
 
@@ -322,16 +325,21 @@ __global__ void copy_blocks_kernel(
   int64_t* value_cache_ptrs,
   const int* __restrict__ block_mapping,
   const int numel_per_block) {
+  // operate based on 'one thread' granularity
   const int layer_idx = blockIdx.x;
   const int pair_idx = blockIdx.y;
-
+  // fetch the specific cache values of this block.
   scalar_t* key_cache = reinterpret_cast<scalar_t*>(key_cache_ptrs[layer_idx]);
   scalar_t* value_cache = reinterpret_cast<scalar_t*>(value_cache_ptrs[layer_idx]);
   int src_block_number = block_mapping[2 * pair_idx];
   int dst_block_number = block_mapping[2 * pair_idx + 1];
-
+  // 注意一下数据排布的方式，这边计算src_block_off的方式是正确的
+  // 因为key_cache_ptrs是对二维数据的一维处理化，value_cache也是同理
   const int src_block_offset = src_block_number * numel_per_block;
   const int dst_block_offset = dst_block_number * numel_per_block;
+  // blockdimension in x axis.
+  // 让线程使用了interleaving的方式来做这件事，每个线程都完成一列上的任务，而不是一个点
+  // 后面的赋值是简单的数据拷贝
   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
     int src_offset = src_block_offset + i;
     int dst_offset = dst_block_offset + i;
@@ -345,4 +353,10 @@ __global__ void copy_blocks_kernel(
 }
 
 } // namespace vllm
+```
+到这边似乎`cache`上的操作就看得差不多了，继续往下推。
+#### _prepare_inputs：
+该函数在cache操作结束后，根据`seq_group_metadata_list`来准备一会儿开始跑`model`时的输入`tensors`信息。
+```python
+
 ```
