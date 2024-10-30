@@ -41,3 +41,9 @@ mkdir -p `dirname /home/link/Desktop/riscv-kvm/opensbi/build/platform/generic/fi
 阅读研究这边的资料很有帮助：
 
 https://blog.csdn.net/zyhse/article/details/138545606
+
+正确的调试方式：应该是先进去，再读那个elf文件，否则会发现符号表的缺失：
+
+https://www.bilibili.com/read/cv39626090/?jump_opus=1
+
+目前发现这样很好，继续配合着泰晓科技的资料学习。
