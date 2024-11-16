@@ -497,6 +497,7 @@ def forward_step(self):
         # Run a decode batch
         if self.running_batch is not None:
             # Run a few decode batches continuously for reducing overhead
+            # 一个step，跑多次forward_decode_batch函数
             for _ in range(global_config.num_continue_decode_steps):
                 self.num_generated_tokens += len(self.running_batch.reqs)
                 self.forward_decode_batch(self.running_batch)
@@ -792,8 +793,11 @@ def handle_finished_requests(self, batch: Batch):
 从上面可以看出，在处理一个Batch级别的请求时，一旦完成了相关请求，就真的会通过cache_req中的del_in_memory_pool来对相关请求所占据的token indices和reqs本身的内存进行释放。
 
 但如果真的只这么做，是否会出现没有办法缓存得当的问题？比如说就没有这个缓存效果了？finished_reqs是否真的在memory_pool里头没有用武之地了？
+
+这似乎并不是真正地把相关地内存信息给丢掉了，他们一直存放着，只不过现在把mem_state设置成了True，表示这一部分确实可能已经占据满了。然后free这边像是只是释放掉现在动态使用的那一部分内存。
 #### cache_filled_batch
 ```python
+# output_ids仅由后面的decode环节所产生，在一开始prefill的时候，这个东西一直都是没有的
 def cache_filled_batch(self, batch: Batch):
     req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
     for i, req in enumerate(batch.reqs):
@@ -806,8 +810,81 @@ def cache_filled_batch(self, batch: Batch):
         )
         req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
 ```
-这边好像把batch中还没有跑完的那些reqs拿去重新填写tree_cache。
+这边好像把batch中还没有跑完的那些reqs拿去重新填写tree_cache。现在我们差不多可以总结了
 
+
+### Prefill过程总结
 prefill的过程：
-- 分配内存空间，尝试找到满足当前内存空间的最大batch，用来准备做prefill的处理
-- 拿去做完prefill的过程
+- 分配内存空间，尝试找到满足当前内存空间的最大batch，用来准备做prefill的处理，这一步其实已经把所有该分配的分配了
+- 拿去做完prefill的过程，通过forward送到model内进行处理，这边主要是在forward_extend函数之中
+- 跑完之后，通过handle_finished_requests，处理掉被判断为finished的reqs，并释放他们相关的memory_pool内存
+
+finished判断的条件一共四种：长度到了max_new_tokens，出现了EOS标志符，出现了声称终止的字符串，以及在发送了abortreq类型请求的情况。
+
+在forward_prefill_batch的环节，存在一个extend环节，会通过采样然后把下一个token_id放入到output_ids之中去
+
+#### 其他
+关于req_to_token的使用
+#### forward_decode_batch
+```python
+def forward_decode_batch(self, batch: Batch):
+    # Check if decode out of memory
+    # 先保证token_to_kv_pool对于bs = len(self.reqs)的空间是足够的，如果不够，可以考虑先evict
+    if not batch.check_decode_mem():
+        # 如果空间真的不够了，转而使用retract_decode，可能需要撤回一些请求先
+        old_ratio = self.new_token_ratio
+
+        retracted_reqs, new_token_ratio = batch.retract_decode()
+        self.new_token_ratio = new_token_ratio
+
+        logger.info(
+            "decode out of memory happened, "
+            f"#retracted_reqs: {len(retracted_reqs)}, "
+            f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+        )
+        self.forward_queue.extend(retracted_reqs)
+    else:
+        self.new_token_ratio = max(
+            self.new_token_ratio - self.new_token_ratio_decay,
+            self.min_new_token_ratio,
+        )
+
+    if not self.disable_regex_jump_forward:
+        # Check for jump-forward
+        jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
+        self.forward_queue.extend(jump_forward_reqs)
+        if batch.is_empty():
+            return
+
+    # Update batch tensors
+    self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
+    batch.prepare_for_decode()
+
+    # Forward and sample the next tokens
+    output = self.model_runner.forward(batch, ForwardMode.DECODE)
+    next_token_ids = batch.sample(output.next_token_logits)
+
+    # Move logprobs to cpu
+    if output.next_token_logprobs is not None:
+        next_token_logprobs = output.next_token_logprobs[
+            torch.arange(len(next_token_ids), device=next_token_ids.device),
+            next_token_ids,
+        ].tolist()
+
+    next_token_ids = next_token_ids.tolist()
+
+    # Check finish condition
+    for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        req.completion_tokens_wo_jump_forward += 1
+        req.output_ids.append(next_token_id)
+        req.check_finished()
+
+        if req.return_logprob:
+            req.output_token_logprobs.append(
+                (next_token_logprobs[i], next_token_id)
+            )
+            if req.top_logprobs_num > 0:
+                req.output_top_logprobs.append(output.output_top_logprobs[i])
+
+    self.handle_finished_requests(batch)
+```
